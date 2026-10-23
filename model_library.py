@@ -19,6 +19,7 @@ from datetime import datetime
 from typing import Optional
 
 import storage
+from file_store import atomic_write_text, file_transaction
 
 def _data_dir_or_none() -> Optional[str]:
     """Resolve user data dir, returning None for anonymous/admin contexts.
@@ -79,6 +80,9 @@ def _ensure_personas_dir():
 
 def _persona_dir(model_id: str) -> str:
     """Return the persona directory for a given model ID."""
+    if (not isinstance(model_id, str) or not model_id
+            or model_id in {".", ".."} or "/" in model_id or "\\" in model_id):
+        raise ValueError("invalid model id")
     return os.path.join(_personas_dir(), model_id)
 
 
@@ -170,8 +174,10 @@ def _init_persona_files(model_id: str, model: dict | None = None):
     os.makedirs(pdir, exist_ok=True)
 
     soul_dest = os.path.join(pdir, "soul.md")
-    if not os.path.exists(soul_dest) and os.path.exists(_DEFAULT_SOUL_PATH):
-        shutil.copy2(_DEFAULT_SOUL_PATH, soul_dest)
+    with file_transaction(soul_dest):
+        if not os.path.exists(soul_dest) and os.path.exists(_DEFAULT_SOUL_PATH):
+            with open(_DEFAULT_SOUL_PATH, encoding="utf-8") as handle:
+                atomic_write_text(soul_dest, handle.read())
 
     # Try to extract a real thumbnail from the model data
     _try_set_model_avatar(model_id, model)
@@ -424,12 +430,43 @@ def find_models_by_name(query: str) -> list:
 
 
 def get_persona_soul_path(model_id: str | None = None) -> str:
-    """Return the soul.md path for a model. Falls back to project default."""
-    if model_id:
-        p = os.path.join(_persona_dir(model_id), "soul.md")
+    """Read a scoped persona, or the immutable bundled template.
+
+    A user with no Live2D model still has an independent default persona.
+    Reading never creates a copy; all writes use get_writable_soul_path.
+    """
+    if _data_dir_or_none():
+        p = get_writable_soul_path(model_id)
         if os.path.exists(p):
             return p
     return _DEFAULT_SOUL_PATH
+
+
+def get_writable_soul_path(model_id: str | None = None) -> str:
+    directory = _data_dir_or_none()
+    if not directory:
+        raise ValueError("persona data context required")
+    if model_id is not None:
+        return os.path.join(_persona_dir(model_id), "soul.md")
+    return os.path.join(directory, "personas", "_default", "soul.md")
+
+
+def save_active_soul(content: str):
+    active = get_active_model()
+    save_persona_soul(active["id"] if active else None, content)
+
+
+def update_persona_fields(fields: dict, model_id: str | None = None):
+    """Apply a partial editor update without erasing unexposed sections."""
+    from character import update_soul_fields
+    path = get_writable_soul_path(model_id)
+    with file_transaction(path):
+        source = get_persona_soul_path(model_id)
+        text = ""
+        if os.path.exists(source):
+            with open(source, encoding="utf-8") as handle:
+                text = handle.read()
+        atomic_write_text(path, update_soul_fields(text, fields))
 
 
 def get_persona_avatar_path(model_id: str | None = None) -> str:
@@ -480,13 +517,13 @@ def save_persona_avatar(model_id: str, file_data: bytes, ext: str = "jpeg") -> s
     return dest
 
 
-def save_persona_soul(model_id: str, content: str):
+def save_persona_soul(model_id: str | None, content: str):
     """Write soul.md content for a specific model."""
-    _ensure_personas_dir()
-    pdir = _persona_dir(model_id)
-    os.makedirs(pdir, exist_ok=True)
-    with open(os.path.join(pdir, "soul.md"), "w", encoding="utf-8") as f:
-        f.write(content)
+    if not isinstance(content, str):
+        raise ValueError("persona content must be text")
+    path = get_writable_soul_path(model_id)
+    with file_transaction(path):
+        atomic_write_text(path, content)
 
 
 def read_persona_soul(model_id: str) -> str:

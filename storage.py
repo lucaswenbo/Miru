@@ -2,8 +2,10 @@ import json
 import os
 import shutil
 from datetime import datetime
+from functools import wraps
 
 from PIL import Image, ImageOps
+from file_store import atomic_write_text, file_transaction
 
 DATA_DIR = os.environ.get("DATA_DIR", os.path.join(os.path.dirname(__file__), "data"))
 ARCHIVE_DIR = os.path.join(DATA_DIR, "archive")
@@ -119,34 +121,49 @@ def compress_image(input_path, max_size=1600, quality=85):
 
 def read_json(path):
     _ensure_dirs()
-    if not os.path.exists(path):
-        write_json(path, [])
-        return []
-    with open(path, "r", encoding="utf-8") as f:
-        return json.load(f)
+    with file_transaction(path):
+        if not os.path.exists(path):
+            write_json(path, [])
+            return []
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
 
 
 def write_json(path, data):
-    """Atomic JSON write: write to temp file then rename to prevent corruption."""
+    """Atomic replacement; read/modify/write callers must hold json_transaction."""
     _ensure_dirs()
-    tmp_path = path + ".tmp"
-    with open(tmp_path, "w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
-        f.flush()
-        os.fsync(f.fileno())
-    os.replace(tmp_path, path)
+    with file_transaction(path):
+        atomic_write_text(path, json.dumps(data, ensure_ascii=False, indent=2))
+
+
+def json_transaction(path):
+    """Serialize a complete JSON read/modify/write across local processes."""
+    _ensure_dirs()
+    return file_transaction(path)
+
+
+def _json_locked(path_factory):
+    def decorate(function):
+        @wraps(function)
+        def locked(*args, **kwargs):
+            with json_transaction(path_factory()):
+                return function(*args, **kwargs)
+        return locked
+    return decorate
 
 
 def timeline_path():
     return os.path.join(get_data_dir(),"timeline.json")
 
 
+@_json_locked(timeline_path)
 def append_timeline(msg):
     items = read_json(timeline_path())
     items.append(msg)
     write_json(timeline_path(), items)
 
 
+@_json_locked(timeline_path)
 def delete_timeline_entry(msg_id):
     """Remove a timeline entry by id. Also deletes associated image file.
 
@@ -178,6 +195,7 @@ def daily_reviews_path():
     return os.path.join(get_data_dir(),"daily_reviews.json")
 
 
+@_json_locked(daily_reviews_path)
 def save_daily_review(review):
     """Save a daily review, keyed by date. Overwrites same-date review."""
     reviews = read_json(daily_reviews_path())
@@ -216,6 +234,7 @@ def tomorrow_plans_path():
     return os.path.join(get_data_dir(),"tomorrow_plans.json")
 
 
+@_json_locked(tomorrow_plans_path)
 def save_tomorrow_plan(plan):
     _ensure_dirs()
     plan["saved_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -326,9 +345,11 @@ def chat_history_path():
 
 
 def append_chat_message(msg):
-    history = read_json(chat_history_path())
-    history.append(msg)
-    write_json(chat_history_path(), history)
+    path = chat_history_path()
+    with json_transaction(path):
+        history = read_json(path)
+        history.append(msg)
+        write_json(path, history)
 
 
 def get_chat_history(limit=50):
@@ -394,6 +415,7 @@ def pending_notifications_path():
     return os.path.join(get_data_dir(),"pending_notifications.json")
 
 
+@_json_locked(pending_notifications_path)
 def add_pending_notification(msg_id: str, text: str, msg_type: str = "proactive"):
     """Add a notification for offline devices to pick up."""
     _ensure_dirs()
@@ -411,6 +433,7 @@ def add_pending_notification(msg_id: str, text: str, msg_type: str = "proactive"
     write_json(pending_notifications_path(), notifs)
 
 
+@_json_locked(pending_notifications_path)
 def get_pending_notifications(device_id: str, mark_read: bool = True):
     """Return unread notifications for a device, optionally marking them read."""
     notifs = read_json(pending_notifications_path())
@@ -426,6 +449,7 @@ def get_pending_notifications(device_id: str, mark_read: bool = True):
 CHAT_ARCHIVE_KEEP_RECENT = 500  # messages to keep in active file
 
 
+@_json_locked(chat_history_path)
 def archive_old_chat_messages(keep_recent=CHAT_ARCHIVE_KEEP_RECENT):
     """Move old chat messages to monthly archive files.
 

@@ -736,6 +736,7 @@ def _send_via_agent_locked(intent_prompt, context_extra="", msg_type="proactive"
         storage.add_pending_notification(msg_id, reply_text, msg_type)
     except Exception:
         pass
+    _push_proactive_message(msg)
 
     # NOTE: Proactive messages are NOT enqueued to memory.
     # Miru's self-talk is derived from existing memory; feeding it back as
@@ -1058,6 +1059,7 @@ def _append_attention_proactive_message(reply_text: str, intent: dict,
         storage.add_pending_notification(msg_id, reply_text, "proactive")
     except Exception:
         pass
+    _push_proactive_message(msg)
 
     try:
         from attention_engine import get_attention_engine
@@ -1410,6 +1412,37 @@ def _send_push_notifications(reminders):
         storage.write_json(storage.push_subscriptions_path(), subs)
 
 
+def is_web_push_endpoint(endpoint) -> bool:
+    """Only send subscription payloads to supported browser push services.
+
+    Subscriptions are user input; enabling actual delivery must not turn
+    them into an arbitrary server-side URL fetch.
+    """
+    from urllib.parse import urlsplit
+    if not isinstance(endpoint, str) or any(c.isspace() for c in endpoint):
+        return False
+    try:
+        parsed = urlsplit(endpoint)
+        host = parsed.hostname or ""
+        return (parsed.scheme == "https" and parsed.port in (None, 443)
+                and parsed.username is None and parsed.password is None
+                and not parsed.fragment
+                and (host in {"fcm.googleapis.com", "android.googleapis.com", "web.push.apple.com"}
+                     or host.endswith(".push.services.mozilla.com")
+                     or host.endswith(".notify.windows.com")))
+    except ValueError:
+        return False
+
+
+def _push_proactive_message(message: dict):
+    """Best-effort Web Push after durable chat delivery, scoped to this user."""
+    try:
+        send_push_message(get_config().name, message["text"], tag=message["id"], url="/app")
+    except Exception as exc:
+        # A push outage must not retry an already-persisted chat message.
+        print(f"[Push] Proactive notification failed: {type(exc).__name__}")
+
+
 def send_push_message(title: str, body: str, tag: str = "miru-care", url: str = "/"):
     """Send a Web Push notification to all subscribed devices."""
     import json as _json
@@ -1434,23 +1467,29 @@ def send_push_message(title: str, body: str, tag: str = "miru-care", url: str = 
     dead_endpoints = []
 
     for sub in subs:
+        if not isinstance(sub, dict) or not is_web_push_endpoint(sub.get("endpoint")):
+            continue
         try:
             webpush(
                 subscription_info=sub,
                 data=payload,
                 vapid_private_key=vapid_private,
                 vapid_claims=vapid_claims,
+                timeout=5,
             )
         except WebPushException as e:
-            if "410" in str(e) or "404" in str(e):
+            if getattr(getattr(e, "response", None), "status_code", None) in (404, 410):
                 dead_endpoints.append(sub.get("endpoint"))
         except Exception:
             pass
 
     if dead_endpoints:
         dead_set = set(dead_endpoints)
-        subs = [s for s in subs if s.get("endpoint") not in dead_set]
-        storage.write_json(storage.push_subscriptions_path(), subs)
+        path = storage.push_subscriptions_path()
+        with storage.json_transaction(path):
+            current = storage.read_json(path)
+            subs = [s for s in current if s.get("endpoint") not in dead_set]
+            storage.write_json(path, subs)
 
 
 # ---------------------------------------------------------------------------

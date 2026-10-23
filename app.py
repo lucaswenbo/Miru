@@ -91,6 +91,51 @@ def _is_allowed_client_logout_origin(origin: str) -> bool:
     return origin_base in allowed
 
 
+def _cors_origin_allowed(origin: str) -> bool:
+    """Match parsed origins; a hostname prefix is not a trust boundary."""
+    import ipaddress
+    from urllib.parse import urlsplit
+
+    def parse(value):
+        try:
+            parsed = urlsplit(value)
+            if (not parsed.hostname or parsed.username is not None
+                    or parsed.password is not None or parsed.path
+                    or parsed.query or parsed.fragment or any(c.isspace() for c in value)):
+                return None
+            port = parsed.port
+            if port is None:
+                port = {"http": 80, "https": 443}.get(parsed.scheme)
+            return parsed.scheme, parsed.hostname, port
+        except (ValueError, TypeError):
+            return None
+
+    candidate = parse(origin)
+    if candidate is None:
+        return False
+    scheme, hostname, port = candidate
+    if scheme in {"tauri", "capacitor"}:
+        return hostname == "localhost" and port is None
+    if scheme not in {"http", "https"}:
+        return False
+    if hostname == "localhost":
+        return True
+    try:
+        address = ipaddress.ip_address(hostname)
+        if address.is_loopback or any(address in ipaddress.ip_network(network) for network in (
+                "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16")):
+            return True
+    except ValueError:
+        pass
+    domain = os.environ.get("DOMAIN", "").strip().rstrip("/")
+    tunnel = os.environ.get("TUNNEL_URL", "").strip().rstrip("/")
+    allowed = {parse(f"https://{domain}") if domain else None,
+               parse(tunnel) if tunnel else None}
+    return candidate in allowed or (
+        request.path == "/api/auth/logout" and _is_allowed_client_logout_origin(origin)
+    )
+
+
 @app.before_request
 def _before_request():
     """Auth middleware: local requests pass, remote need token."""
@@ -126,25 +171,9 @@ def _before_request():
 def _after_request(response):
     """CORS for desktop pet + LAN devices + disable API caching."""
     origin = request.headers.get('Origin', '')
-    allowed_prefixes = [
-        'http://localhost', 'http://127.0.0.1', 'tauri://localhost',
-        'https://localhost',  # Capacitor 5+ WebView origin (Android APK)
-        'capacitor://localhost',  # Capacitor iOS origin
-        'http://192.168.', 'http://10.', 'http://172.',  # LAN ranges
-    ]
-    # Also allow DOMAIN / tunnel URL origin (HTTPS)
-    domain = os.environ.get("DOMAIN", "").strip().rstrip("/")
-    tunnel_url = os.environ.get("TUNNEL_URL", "").strip().rstrip("/")
-    if domain:
-        allowed_prefixes.append(f"https://{domain}")
-    if tunnel_url:
-        allowed_prefixes.append(tunnel_url)
-    client_logout_origin = (
-        request.path == "/api/auth/logout"
-        and _is_allowed_client_logout_origin(origin)
-    )
-    if client_logout_origin or any(origin == p or origin.startswith(p) for p in allowed_prefixes):
+    if _cors_origin_allowed(origin):
         response.headers['Access-Control-Allow-Origin'] = origin
+        response.vary.add('Origin')
         response.headers['Access-Control-Allow-Headers'] = 'Content-Type, Authorization, If-None-Match, X-Device-Id, X-Miru-Client-Secret'
         # PUT is used by /api/commitments/<cid> (complete/edit). Leaving it
         # off caused browsers to CORS-block the preflight, so the actual PUT
@@ -197,8 +226,17 @@ def _require_instance_owner():
     uid = getattr(g, "user_id", None)
     if getattr(g, "is_admin", False) or not uid or uid == "_admin":
         return {"ok": False, "error": "user token required", "status_code": 401}
+    import auth
     import owner_config
-    return owner_config.ensure_instance_owner(uid)
+    local_user = auth.get_user(uid) or {}
+    # Model setup happens before setup_complete, but only the verified local
+    # account may claim this device's settings, never an arbitrary user token.
+    local_owner = (_is_client_mode and _is_local_single_device_mode()
+                   and uid == (_client_mode_config or {}).get("user_id")
+                   and local_user.get("account_type") == auth.LOCAL_SINGLE_DEVICE_ACCOUNT_TYPE)
+    return owner_config.ensure_instance_owner(
+        uid, allow_claim=bool(local_owner),
+    )
 
 
 def _client_login_connection_error(exc: Exception) -> str:
@@ -2367,14 +2405,19 @@ def api_push_vapid_key():
 def api_push_subscribe():
     """Store a push subscription from the client."""
     sub = request.get_json(silent=True)
-    if not sub or not sub.get("endpoint"):
+    if not isinstance(sub, dict) or not core.is_web_push_endpoint(sub.get("endpoint")):
         return jsonify({"error": "Invalid subscription"}), 400
-    subs = storage.read_json(storage.push_subscriptions_path()) or []
-    # Dedup by endpoint
-    existing = {s.get("endpoint") for s in subs}
-    if sub["endpoint"] not in existing:
+    keys = sub.get("keys")
+    if not isinstance(keys, dict) or not all(isinstance(keys.get(k), str) and keys[k]
+                                          for k in ("auth", "p256dh")):
+        return jsonify({"error": "Invalid subscription keys"}), 400
+    path = storage.push_subscriptions_path()
+    with storage.json_transaction(path):
+        subs = storage.read_json(path) or []
+        # A re-subscription can rotate encryption keys for the same endpoint.
+        subs = [s for s in subs if s.get("endpoint") != sub["endpoint"]]
         subs.append(sub)
-        storage.write_json(storage.push_subscriptions_path(), subs)
+        storage.write_json(path, subs)
     return jsonify({"ok": True})
 
 
@@ -2386,10 +2429,12 @@ def api_push_unsubscribe():
     endpoint = body.get("endpoint", "")
     if not endpoint:
         return jsonify({"error": "Missing endpoint"}), 400
-    subs = storage.read_json(storage.push_subscriptions_path()) or []
-    new_subs = [s for s in subs if s.get("endpoint") != endpoint]
-    if len(new_subs) != len(subs):
-        storage.write_json(storage.push_subscriptions_path(), new_subs)
+    path = storage.push_subscriptions_path()
+    with storage.json_transaction(path):
+        subs = storage.read_json(path) or []
+        new_subs = [s for s in subs if s.get("endpoint") != endpoint]
+        if len(new_subs) != len(subs):
+            storage.write_json(path, new_subs)
     return jsonify({"ok": True, "removed": len(subs) - len(new_subs)})
 
 
@@ -2466,61 +2511,12 @@ def api_character_fields_set():
     if not body:
         return jsonify({"error": "empty body"}), 400
 
-    # Start from current config values
-    cfg = get_config()
-    name = body.get("name", cfg.name)
-    user_address = body.get("user_address", cfg.user_address)
-    personality = body.get("personality", cfg.personality)
-    speech_patterns = body.get("speech_patterns", cfg.speech_patterns)
-    appearance = body.get("appearance", cfg.appearance)
-    backstory = body.get("backstory", cfg.backstory)
-    interests = body.get("interests", cfg.interests)
-
-    # Merge prompt_hints: keep existing, override with provided
-    hints = dict(cfg.prompt_hints)
-    if "prompt_hints" in body and isinstance(body["prompt_hints"], dict):
-        hints.update(body["prompt_hints"])
-
-    # Reconstruct soul.md content
-    lines = []
-    lines.append("# Identity")
-    lines.append("")
-    lines.append(f"- **Name**: {name}")
-    lines.append(f"- **User Address**: {user_address}")
-    lines.append("")
-    lines.append("# Personality")
-    lines.append("")
-    lines.append(personality)
-    lines.append("")
-    lines.append("# Speech Patterns")
-    lines.append("")
-    lines.append(speech_patterns)
-    lines.append("")
-    lines.append("# Appearance")
-    lines.append("")
-    lines.append(appearance)
-    lines.append("")
-    lines.append("# Backstory")
-    lines.append("")
-    lines.append(backstory)
-    lines.append("")
-    lines.append("# Interests")
-    lines.append("")
-    lines.append(interests)
-    lines.append("")
-    lines.append("# Prompt Hints")
-    lines.append("")
-    for k, v in hints.items():
-        lines.append(f"- {k}: {v}")
-    lines.append("")
-
-    content = "\n".join(lines)
-
-    # Write to the active soul.md path
-    soul_path = character._resolve_soul_path()
-    os.makedirs(os.path.dirname(soul_path), exist_ok=True)
-    with open(soul_path, "w", encoding="utf-8") as f:
-        f.write(content)
+    import model_library
+    active = model_library.get_active_model()
+    try:
+        model_library.update_persona_fields(body, active["id"] if active else None)
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 400
 
     # Reload config so all modules pick up changes
     reload_config()
@@ -3319,12 +3315,10 @@ def api_soul_set():
     content = body.get("content")
     if content is None:
         return jsonify({"error": "missing content"}), 400
-    active = model_library.get_active_model()
-    if active:
-        model_library.save_persona_soul(active["id"], content)
-    else:
-        with open(SOUL_PATH, "w", encoding="utf-8") as f:
-            f.write(content)
+    try:
+        model_library.save_active_soul(content)
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 400
     cfg = reload_config()
     return jsonify({"ok": True, "name": cfg.name, "user_address": cfg.user_address})
 
@@ -3567,43 +3561,10 @@ def api_model_fields_set(model_id):
     if not body:
         return jsonify({"error": "empty body"}), 400
 
-    # Read current values as fallback
-    soul_path = model_library.get_persona_soul_path(model_id)
-    from character import CharacterConfig
-    cfg = CharacterConfig()
-    if os.path.exists(soul_path):
-        with open(soul_path, "r", encoding="utf-8") as f:
-            cfg._parse(f.read())
-
-    name = body.get("name", cfg.name)
-    user_address = body.get("user_address", cfg.user_address)
-    personality = body.get("personality", cfg.personality)
-    speech_patterns = body.get("speech_patterns", cfg.speech_patterns)
-    appearance = body.get("appearance", cfg.appearance)
-    backstory = body.get("backstory", cfg.backstory)
-    interests = body.get("interests", cfg.interests)
-
-    hints = dict(cfg.prompt_hints)
-    if "prompt_hints" in body and isinstance(body["prompt_hints"], dict):
-        hints.update(body["prompt_hints"])
-
-    lines = [
-        "# Identity", "",
-        f"- **Name**: {name}",
-        f"- **User Address**: {user_address}", "",
-        "# Personality", "", personality, "",
-        "# Speech Patterns", "", speech_patterns, "",
-        "# Appearance", "", appearance, "",
-        "# Backstory", "", backstory, "",
-        "# Interests", "", interests, "",
-        "# Prompt Hints", "",
-    ]
-    for k, v in hints.items():
-        lines.append(f"- {k}: {v}")
-    lines.append("")
-
-    content = "\n".join(lines)
-    model_library.save_persona_soul(model_id, content)
+    try:
+        model_library.update_persona_fields(body, model_id)
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 400
 
     active = model_library.get_active_model()
     if active and active.get("id") == model_id:

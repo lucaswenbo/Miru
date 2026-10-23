@@ -6,9 +6,10 @@ under ``data/_admin``. The normal app user therefore needs a narrow "owner"
 permission to edit those instance settings without exposing the broader
 ``/api/admin/*`` surface.
 
-The first active user who touches an owner endpoint claims the instance. If a
-reset deletes that user while preserving ``_admin`` config, the next active
-user may reclaim ownership; this keeps ``reset.sh --user-data`` usable.
+Shared servers never grant instance settings to the first visitor. Operators
+can set MIRU_INSTANCE_OWNER_USER_ID, or explicitly enable legacy private-server
+claiming with MIRU_ALLOW_OWNER_CLAIM=1. Local single-device clients can claim
+their own instance. Existing owner assignments remain valid.
 """
 
 from __future__ import annotations
@@ -19,6 +20,7 @@ import threading
 from datetime import datetime
 
 import auth
+from file_store import atomic_write_text, file_transaction
 
 
 _lock = threading.RLock()
@@ -43,12 +45,7 @@ def _load_owner() -> dict:
 def _save_owner(data: dict) -> None:
     path = _owner_path()
     os.makedirs(os.path.dirname(path), exist_ok=True)
-    tmp = path + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
-        f.flush()
-        os.fsync(f.fileno())
-    os.replace(tmp, path)
+    atomic_write_text(path, json.dumps(data, ensure_ascii=False, indent=2))
 
 
 def _is_active_user(user_id: str | None) -> bool:
@@ -58,7 +55,7 @@ def _is_active_user(user_id: str | None) -> bool:
     return bool(user and user.get("status") == "active")
 
 
-def ensure_instance_owner(user_id: str | None) -> dict:
+def ensure_instance_owner(user_id: str | None, *, allow_claim: bool = False) -> dict:
     """Claim or verify instance ownership for ``user_id``.
 
     Returns a small result dict:
@@ -71,11 +68,17 @@ def ensure_instance_owner(user_id: str | None) -> dict:
         return {"ok": False, "error": "active user required", "status_code": 401}
 
     now = datetime.now().isoformat(timespec="seconds")
-    with _lock:
+    with _lock, file_transaction(_owner_path()):
         data = _load_owner()
         owner_id = (data.get("owner_user_id") or "").strip()
-
-        if owner_id and _is_active_user(owner_id):
+        configured_owner = os.environ.get("MIRU_INSTANCE_OWNER_USER_ID", "").strip()
+        if configured_owner:
+            if configured_owner != user_id:
+                return {"ok": False, "error": "instance owner only", "status_code": 403}
+            # An operator-selected owner overrides a historical auto-claim.
+            if owner_id == user_id:
+                return {"ok": True, "owner_user_id": user_id, "claimed": False}
+        elif owner_id and _is_active_user(owner_id):
             if owner_id != user_id:
                 return {
                     "ok": False,
@@ -84,6 +87,13 @@ def ensure_instance_owner(user_id: str | None) -> dict:
                     "owner_user_id": owner_id,
                 }
             return {"ok": True, "owner_user_id": owner_id, "claimed": False}
+
+        claiming_enabled = allow_claim or os.environ.get("MIRU_ALLOW_OWNER_CLAIM", "").lower() in {
+            "1", "true", "yes", "on",
+        }
+        if not configured_owner and not claiming_enabled:
+            return {"ok": False, "error": "instance owner must be assigned by the operator",
+                    "status_code": 403}
 
         # First claim, or reclaim after reset/delete left a stale owner file.
         new_data = {

@@ -107,6 +107,54 @@ class CharacterConfig:
 _configs: dict[str, tuple[CharacterConfig, str]] = {}
 
 
+def update_soul_fields(text: str, fields: dict) -> str:
+    """Edit only supplied fields, preserving other sections and identity lines."""
+    if not isinstance(fields, dict):
+        raise ValueError("character fields must be an object")
+    parts = re.split(r"(?m)(?=^#[ \t]+)", text)
+
+    def edit_section(title, edit):
+        for i, part in enumerate(parts):
+            heading = re.match(r"#[ \t]+([^\r\n]+)\r?\n?", part)
+            if heading and heading.group(1).strip().lower() == title.lower():
+                parts[i] = heading.group(0).rstrip() + "\n" + edit(part[heading.end():])
+                return
+        parts.append("\n# " + title + "\n" + edit(""))
+
+    def edit_line(body, pattern, replacement):
+        if re.search(pattern, body, re.MULTILINE):
+            return re.sub(pattern, lambda _: replacement, body, count=1, flags=re.MULTILINE)
+        return body.rstrip() + "\n" + replacement + "\n\n"
+
+    for field, label in (("name", "Name"), ("user_address", "User Address")):
+        if field in fields:
+            value = fields[field]
+            if not isinstance(value, str) or "\n" in value or "\r" in value:
+                raise ValueError(f"{field} must be a single line of text")
+            edit_section("Identity", lambda body, label=label, value=value: edit_line(
+                body, r"^.*\*\*" + label + r"\*\*:[^\r\n]*", f"- **{label}**: {value}"))
+
+    sections = {"personality": "Personality", "speech_patterns": "Speech Patterns",
+                "appearance": "Appearance", "backstory": "Backstory", "interests": "Interests"}
+    for field, title in sections.items():
+        if field in fields:
+            value = fields[field]
+            if not isinstance(value, str):
+                raise ValueError(f"{field} must be text")
+            edit_section(title, lambda _, value=value: "\n" + value.rstrip() + "\n\n")
+    if "prompt_hints" in fields:
+        hints = fields["prompt_hints"]
+        if not isinstance(hints, dict):
+            raise ValueError("prompt_hints must be an object")
+        for key, value in hints.items():
+            if (not isinstance(key, str) or not re.fullmatch(r"\w+", key)
+                    or not isinstance(value, str) or "\n" in value or "\r" in value):
+                raise ValueError("prompt hints must have word keys and single-line text values")
+            edit_section("Prompt Hints", lambda body, key=key, value=value: edit_line(
+                body, r"^-[ \t]+" + re.escape(key) + r":[^\r\n]*", f"- {key}: {value}"))
+    return "".join(parts)
+
+
 def _current_user_id() -> str:
     try:
         from flask import g
@@ -132,15 +180,21 @@ def get_config():
     """
     uid = _current_user_id()
     soul_path = _resolve_soul_path()
+    try:
+        stat = os.stat(soul_path)
+        signature = (stat.st_ino, stat.st_mtime_ns, stat.st_ctime_ns, stat.st_size)
+    except FileNotFoundError:
+        signature = None
 
     cached = _configs.get(uid)
     if cached is not None:
         cfg, cached_path = cached
         # Auto-invalidate if the active model changed
-        if cached_path == soul_path:
+        if cached_path == soul_path and getattr(cfg, "_source_signature", None) == signature:
             return cfg
 
     cfg = CharacterConfig()
+    cfg._source_signature = signature
     if os.path.exists(soul_path):
         with open(soul_path, "r", encoding="utf-8") as f:
             cfg._parse(f.read())

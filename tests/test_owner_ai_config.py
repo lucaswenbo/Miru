@@ -16,6 +16,10 @@ def owner_app(tmp_path, monkeypatch):
     monkeypatch.setenv("DATA_DIR", data_dir)
     monkeypatch.setenv("SERVER_IP", "203.0.113.42")
     monkeypatch.setenv("SERVER_PORT", "5001")
+    # These existing cases exercise an explicitly opted-in private server.
+    # Shared-server defaults are covered separately below.
+    monkeypatch.setenv("MIRU_ALLOW_OWNER_CLAIM", "1")
+    monkeypatch.delenv("MIRU_INSTANCE_OWNER_USER_ID", raising=False)
     for key in (
         "AI_VISION_HOST", "AI_VISION_KEY", "AI_VISION_MODEL",
         "AI_CHAT_HOST", "AI_CHAT_KEY", "AI_CHAT_MODEL",
@@ -247,3 +251,51 @@ def test_owner_ai_config_test_endpoint_is_owner_guarded_and_sanitized(owner_app,
     assert body["http_status"] == 401
     assert body["host"] == "api.example.com"
     assert body["model"] == "model-x"
+
+
+def test_shared_server_does_not_assign_owner_to_first_visitor(owner_app, monkeypatch):
+    monkeypatch.delenv("MIRU_ALLOW_OWNER_CLAIM")
+    token = _seed_user(owner_app["admin_dir"], "u_first")
+    response = owner_app["client"].get("/api/owner/ai-config", headers=_hdr(token))
+    assert response.status_code == 403
+    assert not os.path.exists(os.path.join(owner_app["admin_dir"], "owner.json"))
+    response = owner_app["client"].patch("/api/owner/ai-config/chat", headers=_hdr(token),
+                                         json={"host": "attacker.invalid", "api_key": "test"})
+    assert response.status_code == 403
+    assert not os.path.exists(os.path.join(owner_app["admin_dir"], "ai_config.json"))
+
+
+def test_operator_assignment_cannot_be_stolen_by_another_user(owner_app, monkeypatch):
+    monkeypatch.delenv("MIRU_ALLOW_OWNER_CLAIM")
+    monkeypatch.setenv("MIRU_INSTANCE_OWNER_USER_ID", "u_designated")
+    first = _seed_user(owner_app["admin_dir"], "u_first")
+    designated = _seed_user(owner_app["admin_dir"], "u_designated")
+    assert owner_app["client"].get("/api/owner/ai-config", headers=_hdr(first)).status_code == 403
+    response = owner_app["client"].get("/api/owner/ai-config", headers=_hdr(designated))
+    assert response.status_code == 200
+    assert response.json["owner"]["owner_user_id"] == "u_designated"
+
+
+def test_deleted_owner_not_automatically_reclaimed_on_shared_server(owner_app, monkeypatch):
+    monkeypatch.delenv("MIRU_ALLOW_OWNER_CLAIM")
+    token = _seed_user(owner_app["admin_dir"], "u_next")
+    path = os.path.join(owner_app["admin_dir"], "owner.json")
+    with open(path, "w") as handle:
+        json.dump({"owner_user_id": "u_deleted"}, handle)
+    assert owner_app["client"].get("/api/owner/ai-config", headers=_hdr(token)).status_code == 403
+    with open(path) as handle:
+        assert json.load(handle)["owner_user_id"] == "u_deleted"
+
+
+@pytest.mark.parametrize("setup_complete", [False, True])
+def test_verified_local_single_device_can_configure_own_models(owner_app, monkeypatch, setup_complete):
+    monkeypatch.delenv("MIRU_ALLOW_OWNER_CLAIM")
+    import auth
+    local = auth.get_or_create_local_single_device_user()
+    monkeypatch.setattr(owner_app["app_mod"], "_is_client_mode", True)
+    monkeypatch.setattr(owner_app["app_mod"], "_client_mode_config", {
+        **local, "setup_complete": setup_complete,
+    })
+    response = owner_app["client"].get("/api/owner/ai-config", headers=_hdr(local["token"]))
+    assert response.status_code == 200
+    assert response.json["owner"]["owner_user_id"] == local["user_id"]
