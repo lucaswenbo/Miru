@@ -1,15 +1,30 @@
 """Local file transactions shared by threads and cooperating processes."""
 
 from contextlib import contextmanager
+import errno
 import os
 import tempfile
 import threading
+import time
 import weakref
 
 
 _locks = weakref.WeakValueDictionary()
 _locks_guard = threading.Lock()
 _held = threading.local()
+
+
+def _acquire_windows_lock(handle, msvcrt):
+    """Match flock's blocking semantics instead of LK_LOCK's ten retries."""
+    while True:
+        handle.seek(0)
+        try:
+            msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+            return
+        except OSError as exc:
+            if exc.errno not in (errno.EACCES, errno.EAGAIN, errno.EDEADLK):
+                raise
+            time.sleep(0.05)
 
 
 @contextmanager
@@ -39,8 +54,7 @@ def file_transaction(path):
                 if os.fstat(handle.fileno()).st_size == 0:
                     handle.write(b"\0")
                     handle.flush()
-                handle.seek(0)
-                msvcrt.locking(handle.fileno(), msvcrt.LK_LOCK, 1)
+                _acquire_windows_lock(handle, msvcrt)
             else:
                 import fcntl
                 fcntl.flock(handle.fileno(), fcntl.LOCK_EX)

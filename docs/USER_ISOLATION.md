@@ -34,10 +34,12 @@ the historical first-user claim/reclaim behavior:
 MIRU_ALLOW_OWNER_CLAIM=1
 ```
 
-Do not enable this option on a shared service. New self-hosted server setups
-must choose an explicit owner or deliberately enable private-instance
-claiming; a previously unassigned server no longer grants ownership from a
-GET request by default.
+Do not enable this option on a shared service. The private-server installer
+explicitly sets this option for its single-owner instance, including instances
+created by the existing first-run wizard. Operators can override it with
+`MIRU_ALLOW_OWNER_CLAIM=0` and/or select an explicit owner. Generic source and
+Docker starts remain administrator-controlled by default; a previously
+unassigned shared server no longer grants ownership from a GET request.
 
 Chat appends and archiving now hold a per-file transaction across the entire
 read/modify/write. Cooperative local processes use sidecar `.lock` files,
@@ -60,3 +62,19 @@ service: Google FCM, Mozilla Web Push, Apple Web Push, or Windows notification
 services. Unknown/custom providers require deliberate implementation and
 validation, rather than allowing arbitrary server-side URLs. Existing
 subscriptions to unrecognized destinations are skipped during sending.
+
+Browser subscriptions are now registered on every account bootstrap. A
+server-side, versioned endpoint binding allows only the current owner to send;
+a stale registration cannot reclaim an endpoint after an account switch.
+Legacy subscriptions remain silent until the updated app registers them.
+The service worker separately persists a token-free user ID, clears it on
+logout, closes old-account notifications, and drops queued pushes for another
+user even when no page is open. It suppresses system notifications when the
+chat page is visible. Expiry cleanup compares the sent subscription snapshot,
+so an old-key failure cannot remove newly refreshed keys.
+
+Attention delivery marks the intent delivered before external push calls and
+serializes the generation with a local process lock. If a process stops after
+the chat append but before that status write, the next attempt recovers the
+existing message from current or archived history instead of generating it
+again. This does not add durable retries for the external push itself.

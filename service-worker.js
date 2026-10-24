@@ -1,6 +1,37 @@
 // VERSION is checked by the browser — any change triggers SW update
 const APP_VERSION = '__BUILD_VERSION__';
 const CACHE_NAME = 'contextlife-' + APP_VERSION;
+const PUSH_BINDING_CACHE = 'miru-push-binding-v1';
+const PUSH_BINDING_URL = '/__miru_push_user__';
+let pushStateWrites = Promise.resolve();
+
+async function readPushUser() {
+  await pushStateWrites;
+  const cache = await caches.open(PUSH_BINDING_CACHE);
+  const response = await cache.match(PUSH_BINDING_URL);
+  return response ? (await response.json()).user_id : '';
+}
+
+function writePushUser(userId) {
+  pushStateWrites = pushStateWrites.catch(() => {}).then(async () => {
+    const cache = await caches.open(PUSH_BINDING_CACHE);
+    await cache.put(PUSH_BINDING_URL, new Response(JSON.stringify({ user_id: userId })));
+    const notifications = await self.registration.getNotifications();
+    notifications.forEach(n => {
+      if (!userId || n.data?.user_id !== userId) n.close();
+    });
+  });
+  return pushStateWrites;
+}
+
+self.addEventListener('message', event => {
+  if (event.data?.type !== 'PUSH_USER') return;
+  if (!event.source || new URL(event.source.url).origin !== self.location.origin) return;
+  const userId = typeof event.data.user_id === 'string' ? event.data.user_id : '';
+  event.waitUntil(writePushUser(userId).then(() => {
+    if (event.ports?.[0]) event.ports[0].postMessage({ ok: true });
+  }));
+});
 const STATIC_ASSETS = [
   '/assets/character-avatar.png',
   '/icon-192.png',
@@ -19,7 +50,7 @@ self.addEventListener('install', (event) => {
 self.addEventListener('activate', (event) => {
   event.waitUntil(
     caches.keys().then((keys) => {
-      const oldKeys = keys.filter((k) => k !== CACHE_NAME);
+      const oldKeys = keys.filter((k) => k !== CACHE_NAME && k !== PUSH_BINDING_CACHE);
       return Promise.all(oldKeys.map((k) => caches.delete(k))).then(() => {
         // Only notify clients if old caches were replaced (= real version update)
         if (oldKeys.length > 0) {
@@ -86,17 +117,23 @@ self.addEventListener('push', (event) => {
     data.body = event.data ? event.data.text() : data.body;
   }
 
-  event.waitUntil(
-    self.registration.showNotification(data.title || 'Miru 提醒', {
+  event.waitUntil((async () => {
+    // A queued push can arrive after logout or a different account logs in.
+    // Fail closed for old/unbound payloads, including legacy subscriptions.
+    if (!data.user_id || data.user_id !== await readPushUser()) return;
+    const clients = await self.clients.matchAll({ type: 'window', includeUncontrolled: true });
+    if (clients.some(client => client.visibilityState === 'visible'
+        && new URL(client.url).pathname === '/app')) return;
+    await self.registration.showNotification(data.title || 'Miru 提醒', {
       body: data.body || '',
       icon: '/icon-192.png',
       badge: '/icon-192.png',
-      data: { url: data.url || '/' },
+      data: { url: data.url || '/app', user_id: data.user_id },
       vibrate: [200, 100, 200],
       tag: data.tag || 'miru-reminder',
       renotify: true,
-    })
-  );
+    });
+  })());
 });
 
 // Notification click: open/focus the app
@@ -105,7 +142,11 @@ self.addEventListener('notificationclick', (event) => {
   const url = event.notification.data?.url || '/';
 
   event.waitUntil(
-    self.clients.matchAll({ type: 'window', includeUncontrolled: true }).then((clients) => {
+    readPushUser().then(userId => {
+      if (!userId || event.notification.data?.user_id !== userId) return null;
+      return self.clients.matchAll({ type: 'window', includeUncontrolled: true });
+    }).then((clients) => {
+      if (!clients) return;
       for (const client of clients) {
         if (client.url.includes(self.location.origin) && 'focus' in client) {
           return client.focus();

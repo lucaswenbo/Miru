@@ -195,3 +195,44 @@ def test_self_host_defaults_are_current_release_and_cloud_neutral():
     assert "miru-server-v0.2.0-linux-amd64.tar.gz" in readme
     assert "metadata.tencentyun.com" not in common
     assert "metadata.tencentyun.com" not in install
+
+
+@pytest.mark.skipif(os.name == "nt", reason="Private installer requires a POSIX shell")
+@pytest.mark.parametrize("claim,owner,expected", [(None, "", "1"), ("0", "u_selected", "0")])
+def test_private_installer_preserves_owner_setup_without_deploying(tmp_path, claim, owner, expected):
+    """Execute only the runtime-file writer; never install/start Docker or SSH."""
+    import os
+    import sys
+    source = (SELF_HOST / "install.sh").read_text()
+    writer = source[source.index("write_runtime_files() {"):source.index("\nmain() {")]
+    script = tmp_path / "write-config-only.sh"
+    script.write_text("""set -euo pipefail
+ensure_runtime_dir() { mkdir -p "$@"; }
+install_runtime_file() { install -m "$1" "$2" "$3"; }
+die() { exit 2; }
+FORCE=1
+MIRU_IMAGE=miru/server:test
+MIRU_CONTAINER_NAME=miru-test
+SERVER_IP=127.0.0.1
+SERVER_PORT=5001
+AI_VISION_HOST=''
+AI_VISION_MODEL=''
+AI_CHAT_HOST=''
+AI_CHAT_MODEL=''
+AI_MEMORY_HOST=''
+AI_MEMORY_MODEL=''
+""" + writer + "\nwrite_runtime_files\n")
+    env = dict(os.environ, MIRU_HOME=str(tmp_path / "instance"), SCRIPT_DIR=str(SELF_HOST),
+               MIRU_INSTANCE_OWNER_USER_ID=owner,
+               PATH=str(Path(sys.executable).parent) + os.pathsep + os.environ.get("PATH", ""))
+    for key in list(env):
+        if key.startswith("AI_"):
+            env.pop(key)
+    if claim is None:
+        env.pop("MIRU_ALLOW_OWNER_CLAIM", None)
+    else:
+        env["MIRU_ALLOW_OWNER_CLAIM"] = claim
+    subprocess.run(["bash", str(script)], env=env, check=True, capture_output=True, text=True)
+    lines = (tmp_path / "instance/.env").read_text().splitlines()
+    assert f"MIRU_ALLOW_OWNER_CLAIM={expected}" in lines
+    assert f"MIRU_INSTANCE_OWNER_USER_ID={owner}" in lines

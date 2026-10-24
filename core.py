@@ -23,6 +23,7 @@ from prompt_identity import (
 )
 from character import get_config
 import storage
+from file_store import file_transaction
 
 ALLOWED_EXTENSIONS = {"png", "jpg", "jpeg", "gif", "webp"}
 
@@ -778,6 +779,11 @@ def _eligible_attention_intents(intent_id: str | None = None):
 def _update_attention_intent(intent_id: str, patch: dict) -> dict | None:
     if not intent_id:
         return None
+    with storage.json_transaction(storage.attention_intent_queue_path()):
+        return _update_attention_intent_locked(intent_id, patch)
+
+
+def _update_attention_intent_locked(intent_id: str, patch: dict) -> dict | None:
     queue = storage.load_attention_intent_queue() or []
     updated = None
     for idx, item in enumerate(queue):
@@ -1047,6 +1053,13 @@ def _append_attention_proactive_message(reply_text: str, intent: dict,
         "time": now.strftime("%Y-%m-%d %H:%M:%S"),
     }
     storage.append_chat_message(msg)
+    # Persist delivery before any external push can block. If the process
+    # stops between these two writes, delivery recovery finds this intent in
+    # chat history and marks it delivered without generating a second reply.
+    _update_attention_intent(intent.get("id", ""), {
+        "status": "delivered", "delivery_status": "delivered",
+        "delivered_at": msg["time"], "message_id": msg_id,
+    })
     storage.set_last_proactive_time()
 
     try:
@@ -1253,12 +1266,42 @@ def deliver_attention_intent_once(intent_id: str | None = None) -> dict | None:
 
     print(f"[AttentionDelivery] claimed intent={resolved_intent_id} user={uid}")
     try:
-        suppression_reason = _attention_delivery_timing_suppression_reason()
-        if suppression_reason:
-            return _suppress_stale_attention_delivery(intent, suppression_reason)
-        return _deliver_claimed_attention_intent(intent)
+        lock_path = os.path.join(storage.get_data_dir(), "_delivery",
+                                 hashlib.sha256(resolved_intent_id.encode()).hexdigest())
+        with file_transaction(lock_path):
+            # Another process may have completed this intent while we waited.
+            current = _eligible_attention_intents(resolved_intent_id)
+            if not current:
+                return None
+            existing = _find_attention_message(resolved_intent_id)
+            if existing:
+                _update_attention_intent(resolved_intent_id, {
+                    "status": "delivered", "delivery_status": "delivered",
+                    "message_id": existing["id"], "delivered_at": existing["time"],
+                })
+                return {"delivery_status": "delivered", "message_id": existing["id"],
+                        "intent_id": resolved_intent_id, "recovered": True}
+            suppression_reason = _attention_delivery_timing_suppression_reason()
+            if suppression_reason:
+                return _suppress_stale_attention_delivery(current[0], suppression_reason)
+            return _deliver_claimed_attention_intent(current[0])
     finally:
         _release_attention_delivery(uid, resolved_intent_id)
+
+
+def _find_attention_message(intent_id: str) -> dict | None:
+    """Recover a committed chat append after a crash before the intent update."""
+    def find(messages):
+        return next((m for m in reversed(messages) if m.get("source") == "attention_engine"
+                     and m.get("intent_id") == intent_id), None)
+    existing = find(storage.read_json(storage.chat_history_path()) or [])
+    if existing:
+        return existing
+    for month in reversed(storage.get_archived_chat_months()):
+        existing = find(storage.get_archived_chat_history(month))
+        if existing:
+            return existing
+    return None
 
 
 def _deliver_claimed_attention_intent(intent: dict) -> dict | None:
@@ -1313,12 +1356,6 @@ def _deliver_claimed_attention_intent(intent: dict) -> dict | None:
         if suppression_reason:
             return _suppress_stale_attention_delivery(intent, suppression_reason)
         msg = _append_attention_proactive_message(reply_text, intent, policy)
-        _update_attention_intent(intent_id, {
-            "status": "delivered",
-            "delivery_status": "delivered",
-            "delivered_at": msg.get("time", now_s),
-            "message_id": msg.get("id", ""),
-        })
         entry["delivery_status"] = "delivered"
         entry["message_id"] = msg.get("id", "")
         entry["reply_preview"] = reply_text[:160]
@@ -1364,52 +1401,9 @@ def build_proactive_agent_preview(intent: dict, delivery_preflight: dict) -> dic
 
 
 def _send_push_notifications(reminders):
-    import json as _json
-
-    runtime = server_config.get()
-    vapid_private = runtime.get("vapid_private_key", "")
-    vapid_public = runtime.get("vapid_public_key", "")
-    if not vapid_private or not vapid_public:
-        return
-
-    try:
-        from pywebpush import webpush, WebPushException
-    except ImportError:
-        return
-
-    subs = storage.read_json(storage.push_subscriptions_path())
-    if not subs:
-        return
-
-    vapid_claims = {"sub": "mailto:contextlife@noreply.dev"}
-    dead_endpoints = []
-
-    cfg = get_config()
     for reminder in reminders:
-        payload = _json.dumps({
-            "title": f"{cfg.name} 提醒 💫",
-            "body": reminder.get("text", ""),
-            "tag": reminder.get("id", "reminder"),
-            "url": "/",
-        })
-        for sub in subs:
-            try:
-                webpush(
-                    subscription_info=sub,
-                    data=payload,
-                    vapid_private_key=vapid_private,
-                    vapid_claims=vapid_claims,
-                )
-            except WebPushException as e:
-                if "410" in str(e) or "404" in str(e):
-                    dead_endpoints.append(sub.get("endpoint"))
-            except Exception:
-                pass
-
-    if dead_endpoints:
-        dead_set = set(dead_endpoints)
-        subs = [s for s in subs if s.get("endpoint") not in dead_set]
-        storage.write_json(storage.push_subscriptions_path(), subs)
+        send_push_message(f"{get_config().name} 提醒 💫", reminder.get("text", ""),
+                          tag=reminder.get("id", "reminder"), url="/app")
 
 
 def is_web_push_endpoint(endpoint) -> bool:
@@ -1458,13 +1452,14 @@ def send_push_message(title: str, body: str, tag: str = "miru-care", url: str = 
     except ImportError:
         return
 
-    subs = storage.read_json(storage.push_subscriptions_path())
+    import push_registry
+    subs = push_registry.subscriptions()
     if not subs:
         return
 
     vapid_claims = {"sub": "mailto:contextlife@noreply.dev"}
-    payload = _json.dumps({"title": title, "body": body, "tag": tag, "url": url})
-    dead_endpoints = []
+    payload = _json.dumps({"title": title, "body": body, "tag": tag, "url": url, "user_id": _current_user_id_safe()})
+    dead_subscriptions = []
 
     for sub in subs:
         if not isinstance(sub, dict) or not is_web_push_endpoint(sub.get("endpoint")):
@@ -1479,17 +1474,12 @@ def send_push_message(title: str, body: str, tag: str = "miru-care", url: str = 
             )
         except WebPushException as e:
             if getattr(getattr(e, "response", None), "status_code", None) in (404, 410):
-                dead_endpoints.append(sub.get("endpoint"))
+                dead_subscriptions.append(sub)
         except Exception:
             pass
 
-    if dead_endpoints:
-        dead_set = set(dead_endpoints)
-        path = storage.push_subscriptions_path()
-        with storage.json_transaction(path):
-            current = storage.read_json(path)
-            subs = [s for s in current if s.get("endpoint") not in dead_set]
-            storage.write_json(path, subs)
+    for snapshot in dead_subscriptions:
+        push_registry.unregister(snapshot["endpoint"], snapshot=snapshot)
 
 
 # ---------------------------------------------------------------------------

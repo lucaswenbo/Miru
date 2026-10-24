@@ -2401,6 +2401,15 @@ def api_push_vapid_key():
     return jsonify({"publicKey": pub_key})
 
 
+@app.route("/api/push/binding", methods=["GET"])
+def api_push_binding():
+    endpoint = request.args.get("endpoint", "")
+    if not core.is_web_push_endpoint(endpoint):
+        return jsonify({"error": "Invalid subscription endpoint"}), 400
+    import push_registry
+    return jsonify({"revision": push_registry.revision(endpoint)})
+
+
 @app.route("/api/push/subscribe", methods=["POST"])
 def api_push_subscribe():
     """Store a push subscription from the client."""
@@ -2411,13 +2420,12 @@ def api_push_subscribe():
     if not isinstance(keys, dict) or not all(isinstance(keys.get(k), str) and keys[k]
                                           for k in ("auth", "p256dh")):
         return jsonify({"error": "Invalid subscription keys"}), 400
-    path = storage.push_subscriptions_path()
-    with storage.json_transaction(path):
-        subs = storage.read_json(path) or []
-        # A re-subscription can rotate encryption keys for the same endpoint.
-        subs = [s for s in subs if s.get("endpoint") != sub["endpoint"]]
-        subs.append(sub)
-        storage.write_json(path, subs)
+    import push_registry
+    revision = sub.pop("binding_version", None)
+    try:
+        push_registry.register(sub, expected_revision=revision)
+    except push_registry.BindingConflict as exc:
+        return jsonify({"error": str(exc)}), 409
     return jsonify({"ok": True})
 
 
@@ -2427,15 +2435,11 @@ def api_push_unsubscribe():
     subscriptions — MiruConnectionService native SSE replaces web push there."""
     body = request.get_json(silent=True) or {}
     endpoint = body.get("endpoint", "")
-    if not endpoint:
+    if not isinstance(endpoint, str) or not endpoint:
         return jsonify({"error": "Missing endpoint"}), 400
-    path = storage.push_subscriptions_path()
-    with storage.json_transaction(path):
-        subs = storage.read_json(path) or []
-        new_subs = [s for s in subs if s.get("endpoint") != endpoint]
-        if len(new_subs) != len(subs):
-            storage.write_json(path, new_subs)
-    return jsonify({"ok": True, "removed": len(subs) - len(new_subs)})
+    import push_registry
+    removed = push_registry.unregister(endpoint)
+    return jsonify({"ok": True, "removed": removed})
 
 
 @app.route("/api/reminders/today", methods=["GET"])
