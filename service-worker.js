@@ -4,16 +4,29 @@ const CACHE_NAME = 'contextlife-' + APP_VERSION;
 const PUSH_BINDING_CACHE = 'miru-push-binding-v1';
 const PUSH_BINDING_URL = '/__miru_push_user__';
 let pushStateWrites = Promise.resolve();
+let pushUserEpoch = 0;
 
-async function readPushUser() {
-  await pushStateWrites;
+async function readPushUserFromCache() {
   const cache = await caches.open(PUSH_BINDING_CACHE);
   const response = await cache.match(PUSH_BINDING_URL);
   return response ? (await response.json()).user_id : '';
 }
 
+async function readPushUser() {
+  await pushStateWrites;
+  return readPushUserFromCache();
+}
+
+function queuePushState(task) {
+  const result = pushStateWrites.catch(() => {}).then(task);
+  pushStateWrites = result;
+  return result;
+}
+
 function writePushUser(userId) {
-  pushStateWrites = pushStateWrites.catch(() => {}).then(async () => {
+  // Invalidate in-flight push handlers immediately, before cache I/O yields.
+  pushUserEpoch++;
+  return queuePushState(async () => {
     const cache = await caches.open(PUSH_BINDING_CACHE);
     await cache.put(PUSH_BINDING_URL, new Response(JSON.stringify({ user_id: userId })));
     const notifications = await self.registration.getNotifications();
@@ -21,7 +34,6 @@ function writePushUser(userId) {
       if (!userId || n.data?.user_id !== userId) n.close();
     });
   });
-  return pushStateWrites;
 }
 
 self.addEventListener('message', event => {
@@ -117,11 +129,15 @@ self.addEventListener('push', (event) => {
     data.body = event.data ? event.data.text() : data.body;
   }
 
-  event.waitUntil((async () => {
+  const bindingEpoch = pushUserEpoch;
+  event.waitUntil(queuePushState(async () => {
     // A queued push can arrive after logout or a different account logs in.
     // Fail closed for old/unbound payloads, including legacy subscriptions.
-    if (!data.user_id || data.user_id !== await readPushUser()) return;
+    if (!data.user_id || bindingEpoch !== pushUserEpoch
+        || data.user_id !== await readPushUserFromCache()) return;
     const clients = await self.clients.matchAll({ type: 'window', includeUncontrolled: true });
+    if (bindingEpoch !== pushUserEpoch || data.user_id !== await readPushUserFromCache()) return;
+    if (bindingEpoch !== pushUserEpoch) return;
     if (clients.some(client => client.visibilityState === 'visible'
         && new URL(client.url).pathname === '/app')) return;
     await self.registration.showNotification(data.title || 'Miru 提醒', {
@@ -133,7 +149,15 @@ self.addEventListener('push', (event) => {
       tag: data.tag || 'miru-reminder',
       renotify: true,
     });
-  })());
+    // If logout raced the browser's own asynchronous display, close the
+    // late notification too, rather than relying on the earlier cleanup.
+    if (bindingEpoch !== pushUserEpoch) {
+      const notifications = await self.registration.getNotifications();
+      notifications.forEach(n => {
+        if (n.data?.user_id === data.user_id) n.close();
+      });
+    }
+  }));
 });
 
 // Notification click: open/focus the app

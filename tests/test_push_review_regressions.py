@@ -14,10 +14,14 @@ import pytest
 from test_persona_edit_isolation import persona_app, headers
 
 
-def _subscribe(client, uid, endpoint, key="key", revision=None):
+_AUTO_REVISION = object()
+
+
+def _subscribe(client, uid, endpoint, key="key", revision=_AUTO_REVISION):
     payload = {"endpoint": endpoint, "keys": {"auth": key, "p256dh": key}}
-    if revision is not None:
-        payload["binding_version"] = revision
+    if revision is _AUTO_REVISION:
+        revision = _binding(client, uid, endpoint)
+    payload["binding_version"] = revision
     return client.post("/api/push/subscribe", headers=headers(uid), json=payload)
 
 
@@ -34,7 +38,8 @@ def test_same_browser_rebind_revokes_old_user_and_rejects_late_registration(pers
     old_revision = _binding(client, "u_alice", endpoint)
     assert _subscribe(client, "u_bob", endpoint, revision=old_revision).status_code == 200
     assert _subscribe(client, "u_alice", endpoint, revision=old_revision).status_code == 409
-    assert _subscribe(client, "u_alice", endpoint).status_code == 409
+    assert client.post("/api/push/subscribe", headers=headers("u_alice"), json={
+        "endpoint": endpoint, "keys": {"auth": "key", "p256dh": "key"}}).status_code == 409
     with app.app.app_context():
         g.user_id = "u_alice"
         g.user_data_dir = str(data / "users/u_alice")
@@ -66,6 +71,21 @@ def test_expired_old_keys_do_not_delete_refreshed_subscription(persona_app, monk
         remaining = push_registry.subscriptions()
         assert len(remaining) == 1
         assert remaining[0]["keys"]["auth"] == "new"
+
+
+def test_explicit_null_binding_revision_cannot_overwrite_a_concurrent_creation(persona_app):
+    client, data, _ = persona_app
+    endpoint = "https://fcm.googleapis.com/fcm/send/first-binding"
+    assert _binding(client, "u_alice", endpoint) is None
+    def initial_request(key):
+        return client.post("/api/push/subscribe", headers=headers("u_alice"), json={
+            "endpoint": endpoint, "keys": {"auth": key, "p256dh": key},
+            "binding_version": None,
+        })
+    assert initial_request("new").status_code == 200
+    assert initial_request("old").status_code == 409
+    saved = json.loads((data / "users/u_alice/push_subscriptions.json").read_text())
+    assert saved[0]["keys"]["auth"] == "new"
 
 
 def test_windows_lock_keeps_retrying_and_propagates_non_contention_errors(tmp_path, monkeypatch):
@@ -189,6 +209,7 @@ const fs = require('node:fs');
 const assert = require('node:assert/strict');
 const stores = new Map();
 let shown = [], clients = [], closed = 0, opened = 0;
+let deferClients = null, queryEntered = false;
 function worker() {
   const events = {};
   const caches = {
@@ -206,7 +227,8 @@ function worker() {
     addEventListener(type, fn) { events[type] = fn; }, skipWaiting() {},
     registration: { async showNotification(title, options) { shown.push(options); },
       async getNotifications() { return shown.map(n => ({data:n.data, close() { closed++; }})); } },
-    clients: { async matchAll() { return clients; }, claim() {}, async openWindow() { opened++; } }
+    clients: { async matchAll() { queryEntered = true; return deferClients || clients; },
+      claim() {}, async openWindow() { opened++; } }
   };
   const context = vm.createContext({self, caches, URL, Response, console});
   vm.runInContext(fs.readFileSync(WORKER, 'utf8'), context);
@@ -230,7 +252,16 @@ async function main() {
   await push('alice'); assert.equal(shown.length, 0);
   clients = [{url:'https://miru.test/app', visibilityState:'hidden'}];
   await push('alice'); assert.equal(shown.length, 1);
-  await bind(fire, 'bob'); assert.equal(closed, 1);
+  // Pause the old user's push after its first identity read, then switch.
+  let releaseClients;
+  deferClients = new Promise(resolve => {releaseClients = resolve;});
+  queryEntered = false;
+  const pendingPush = push('alice');
+  while (!queryEntered) await new Promise(resolve => setImmediate(resolve));
+  const rebinding = bind(fire, 'bob');
+  releaseClients([]); await Promise.all([pendingPush, rebinding]); deferClients = null;
+  assert.equal(closed, 1);
+  assert.equal(shown.length, 1);
   await push('alice'); assert.equal(shown.length, 1);
   await push('bob'); assert.equal(shown.length, 2);
   // Restart the worker: account filtering survives without an open page.
@@ -272,7 +303,7 @@ const reg = {active, addEventListener() {}, pushManager:{async getSubscription()
 const navigator = {serviceWorker:{controller:active, ready:Promise.resolve(reg),
   async register() { return reg; }, async getRegistration() { return reg; }, addEventListener() {}}};
 const context = vm.createContext({window:{PushManager:function(){}}, navigator, MessageChannel,
-  Notification:{permission:'granted'}, console, setTimeout, clearTimeout,
+  Notification:{permission:'granted'}, console, setTimeout, clearTimeout, AbortController,
   _getAuthToken:() => token, _isClientMode:() => false,
   startVersionPolling() {}, startModelPolling() {},
   async fetch(url, options) {
@@ -283,6 +314,7 @@ const context = vm.createContext({window:{PushManager:function(){}}, navigator, 
     throw new Error('unexpected fetch ' + url);
   }
 });
+context._originalFetch = context.fetch;
 vm.runInContext(SCRIPT, context);
 (async () => {
   await context.initPWA();
@@ -293,6 +325,16 @@ vm.runInContext(SCRIPT, context);
   assert.deepEqual(messages, ['', 'alice', '', 'bob']);
   await context._disconnectBrowserPush();
   assert.deepEqual(trace.slice(-3), ['worker:', 'server-unbind', 'unsubscribe']);
+  let releaseRemote, remoteDone = false;
+  const fastFetch = context.fetch;
+  context._originalFetch = context.fetch = function(url, options) {
+    if (url !== '/api/push/unsubscribe') return fastFetch(url, options);
+    return new Promise(resolve => {releaseRemote = () => {remoteDone = true; resolve({ok:true});};});
+  };
+  await context._disconnectBrowserPush();
+  assert.equal(remoteDone, false);
+  assert.equal(trace.at(-1), 'unsubscribe');
+  releaseRemote();
 })().catch(e => {console.error(e); process.exitCode=1;});
 """.replace("SCRIPT", json.dumps(javascript))
     result = subprocess.run(["node", "-e", harness], capture_output=True, text=True, timeout=15)

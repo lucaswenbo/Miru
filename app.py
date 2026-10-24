@@ -2421,9 +2421,9 @@ def api_push_subscribe():
                                           for k in ("auth", "p256dh")):
         return jsonify({"error": "Invalid subscription keys"}), 400
     import push_registry
-    revision = sub.pop("binding_version", None)
+    options = {"expected_revision": sub.pop("binding_version")} if "binding_version" in sub else {}
     try:
-        push_registry.register(sub, expected_revision=revision)
+        push_registry.register(sub, **options)
     except push_registry.BindingConflict as exc:
         return jsonify({"error": str(exc)}), 409
     return jsonify({"ok": True})

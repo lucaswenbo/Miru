@@ -228,8 +228,11 @@ def test_resubscribe_refreshes_keys_without_duplicate_endpoint(persona_app):
     client, data, _ = persona_app
     endpoint = "https://updates.push.services.mozilla.com/wpush/v2/test"
     for key in ("old", "new"):
+        lease = client.get("/api/push/binding", headers=headers("u_alice"),
+                           query_string={"endpoint": endpoint}).json["revision"]
         assert client.post("/api/push/subscribe", headers=headers("u_alice"), json={
             "endpoint": endpoint, "keys": {"auth": key, "p256dh": key},
+            "binding_version": lease,
         }).status_code == 200
     saved = json.loads((data / "users/u_alice/push_subscriptions.json").read_text())
     assert len(saved) == 1

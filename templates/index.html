@@ -11481,10 +11481,22 @@ async function _disconnectBrowserPush() {
     await _setBrowserPushUser(reg, '');
     var sub = await reg.pushManager.getSubscription();
     if (sub) {
-      await fetch('/api/push/unsubscribe', { method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ endpoint: sub.endpoint }) });
-      await sub.unsubscribe();
+      var token = _getAuthToken();
+      var controller = new AbortController();
+      var timeout = setTimeout(function() { controller.abort(); }, 1500);
+      // Remote cleanup must not hold the old account UI/token open. Avoid
+      // the global auth-lost fetch hook after a different user has logged in.
+      _originalFetch('/api/push/unsubscribe', { method: 'POST', keepalive: true,
+        signal: controller.signal,
+        headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + token },
+        body: JSON.stringify({ endpoint: sub.endpoint })
+      }).catch(function() {}).finally(function() { clearTimeout(timeout); });
+      var localTimeout;
+      try {
+        await Promise.race([sub.unsubscribe(), new Promise(function(resolve) {
+          localTimeout = setTimeout(resolve, 1500);
+        })]);
+      } finally { clearTimeout(localTimeout); }
     }
   } catch(e) { _clearBrowserPushUser(); }
 }
@@ -11606,6 +11618,10 @@ async function initPWA() {
         body: JSON.stringify(payload),
       });
       if (bound.status !== 409) break;
+      // A concurrent refresh may have rotated the browser's actual keys.
+      // Never retry a stale in-memory subscription with a fresh lease.
+      sub = await reg.pushManager.getSubscription();
+      if (!sub) return;
     }
     if (bound.ok && _getAuthToken() === pushToken) await _setBrowserPushUser(reg, pushUser);
   } catch (e) {

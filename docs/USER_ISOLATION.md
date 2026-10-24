@@ -73,6 +73,13 @@ user even when no page is open. It suppresses system notifications when the
 chat page is visible. Expiry cleanup compares the sent subscription snapshot,
 so an old-key failure cannot remove newly refreshed keys.
 
+Binding updates and notification display share a worker task queue, so an
+account-change acknowledgement is not returned ahead of older notification
+work. Subscription updates require the current binding revision; a null or
+missing revision can only create an unbound endpoint. Conflict retries read
+the browser's current keys again. Remote logout cleanup runs in the background
+with a bounded timeout and cannot hold local credentials or the old UI open.
+
 Attention delivery marks the intent delivered before external push calls and
 serializes the generation with a local process lock. If a process stops after
 the chat append but before that status write, the next attempt recovers the

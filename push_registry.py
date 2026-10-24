@@ -57,9 +57,11 @@ def register(subscription, *, expected_revision=None):
     with file_transaction(_path()), storage.json_transaction(path):
         bindings = _load()
         previous = bindings.get(_key(subscription))
-        if previous and (previous["user_id"] != uid or expected_revision is not None):
-            if expected_revision != previous.get("revision"):
-                raise BindingConflict("push binding changed; retry with current revision")
+        actual_revision = previous.get("revision") if previous else None
+        # Missing/null means create only if still unbound, never overwrite.
+        # Every update, including same-user key rotation, needs a fresh lease.
+        if expected_revision != actual_revision:
+            raise BindingConflict("push binding changed; retry with current revision")
         bindings[_key(subscription)] = {"user_id": uid, "version": _version(subscription),
                                         "revision": uuid.uuid4().hex}
         # Rebinding first revokes the old user's ability to send. A failure
