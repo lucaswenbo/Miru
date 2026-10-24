@@ -10,7 +10,7 @@ from flask import g
 def _fake_check_request(req=None):
     """Bypass auth middleware in tests."""
     import auth
-    g.user_id = "_admin"
+    g.user_id = "test_push_user"
     g.user_data_dir = os.path.join(auth._BASE_DATA_DIR, "_admin")
     g.is_admin = True
     return None
@@ -35,7 +35,7 @@ def _seed_subs(app_mod, storage, *endpoints):
     with app_mod.app.app_context():
         from flask import g
         import auth
-        g.user_id = "_admin"
+        g.user_id = "test_push_user"
         g.user_data_dir = os.path.join(auth._BASE_DATA_DIR, "_admin")
         g.is_admin = True
         os.makedirs(g.user_data_dir, exist_ok=True)
@@ -49,7 +49,7 @@ def _read_subs(app_mod, storage):
     with app_mod.app.app_context():
         from flask import g
         import auth
-        g.user_id = "_admin"
+        g.user_id = "test_push_user"
         g.user_data_dir = os.path.join(auth._BASE_DATA_DIR, "_admin")
         g.is_admin = True
         return storage.read_json(storage.push_subscriptions_path()) or []

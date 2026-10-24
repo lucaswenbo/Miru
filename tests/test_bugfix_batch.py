@@ -324,16 +324,23 @@ def test_date_regex_extraction():
 # Medium #12: Atomic JSON writes
 # ============================================================
 
-def test_atomic_json_write():
-    """write_json should use atomic write (temp file + rename)."""
-    import inspect, storage
-    source = inspect.getsource(storage.write_json)
-    assert ".tmp" in source, "Should write to temp file first"
-    assert "os.replace" in source or "os.rename" in source, \
-        "Should use os.replace/rename for atomic swap"
-    assert "fsync" in source, "Should fsync before rename"
-    print("TEST: storage.write_json uses atomic writes")
-    print("  [PASS] temp file + fsync + os.replace pattern")
+def test_atomic_json_write(tmp_path, monkeypatch):
+    """A failed replacement must leave the previous JSON fully readable."""
+    import json, pytest, storage, file_store
+    monkeypatch.setattr(storage, "get_data_dir", lambda: str(tmp_path))
+    path = tmp_path / "atomic.json"
+    storage.write_json(path, {"version": "before"})
+    def failed_replace(*_):
+        assert json.loads(path.read_text()) == {"version": "before"}
+        raise OSError("simulated replacement failure")
+    with monkeypatch.context() as patcher:
+        patcher.setattr(file_store.os, "replace", failed_replace)
+        with pytest.raises(OSError, match="replacement failure"):
+            storage.write_json(path, {"version": "after"})
+    assert json.loads(path.read_text()) == {"version": "before"}
+    assert not list(tmp_path.glob(".miru-*.tmp"))
+    storage.write_json(path, {"version": "after"})
+    assert json.loads(path.read_text()) == {"version": "after"}
 
 
 def test_atomic_write_actually_works():

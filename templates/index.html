@@ -4264,6 +4264,9 @@ const _USER_SCOPED_LS_KEYS = [
 // Reset all per-user client state. Used by logout, force re-login, and the
 // shared 401 / auth-lost handler.
 window._purgeAllUserScopedState = function() {
+  // Clear the worker's persisted user before another account can receive a
+  // delayed push. This also applies to auth loss while the browser is offline.
+  _clearBrowserPushUser();
   // 1. localStorage — all registered keys
   _USER_SCOPED_LS_KEYS.forEach(function(k) {
     try { localStorage.removeItem(k); } catch(e) {}
@@ -7108,6 +7111,8 @@ async function settingsSwitchAccount() {
       : '要回到 Miru 初始界面吗？\n\n本地单设备数据会继续留在这台 Mac 上。之后再次选择“只在这台 Mac 使用”，会回到同一个本地 Miru。')
     : '要回到 Miru 初始界面吗？\n\n这只会退出这台设备，不会删除服务器上的聊天、记忆或邀请码。';
   if (!await _confirm(msg, { confirmText: '切换账号' })) return;
+
+  await _disconnectBrowserPush();
 
   try {
     if (typeof window._purgeAllUserScopedState === 'function') {
@@ -11445,6 +11450,57 @@ function startVersionPolling() {
   }, 15000);
 }
 
+function _setBrowserPushUser(reg, userId) {
+  return new Promise(function(resolve, reject) {
+    if (!reg || !reg.active) { reject(new Error('Push worker not active')); return; }
+    var channel = new MessageChannel();
+    var timer = setTimeout(function() { channel.port1.close(); reject(new Error('Push binding timeout')); }, 3000);
+    channel.port1.onmessage = function() {
+      clearTimeout(timer); channel.port1.close(); resolve();
+    };
+    reg.active.postMessage({ type: 'PUSH_USER', user_id: userId }, [channel.port2]);
+  });
+}
+
+function _clearBrowserPushUser() {
+  if (!('serviceWorker' in navigator)) return;
+  if (navigator.serviceWorker.controller) {
+    navigator.serviceWorker.controller.postMessage({ type: 'PUSH_USER', user_id: '' });
+  }
+  navigator.serviceWorker.getRegistration().then(function(reg) {
+    // Do not let a delayed logout task clear a new login's binding.
+    if (!_getAuthToken() && reg) return _setBrowserPushUser(reg, '');
+  }).catch(function() {});
+}
+
+async function _disconnectBrowserPush() {
+  if (!('serviceWorker' in navigator)) return;
+  try {
+    var reg = await navigator.serviceWorker.getRegistration();
+    if (!reg) return;
+    await _setBrowserPushUser(reg, '');
+    var sub = await reg.pushManager.getSubscription();
+    if (sub) {
+      var token = _getAuthToken();
+      var controller = new AbortController();
+      var timeout = setTimeout(function() { controller.abort(); }, 1500);
+      // Remote cleanup must not hold the old account UI/token open. Avoid
+      // the global auth-lost fetch hook after a different user has logged in.
+      _originalFetch('/api/push/unsubscribe', { method: 'POST', keepalive: true,
+        signal: controller.signal,
+        headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + token },
+        body: JSON.stringify({ endpoint: sub.endpoint })
+      }).catch(function() {}).finally(function() { clearTimeout(timeout); });
+      var localTimeout;
+      try {
+        await Promise.race([sub.unsubscribe(), new Promise(function(resolve) {
+          localTimeout = setTimeout(resolve, 1500);
+        })]);
+      } finally { clearTimeout(localTimeout); }
+    }
+  } catch(e) { _clearBrowserPushUser(); }
+}
+
 async function initPWA() {
   if (!('serviceWorker' in navigator)) return;
   // In client mode (DMG), skip SW entirely. SW's version-change activation
@@ -11518,6 +11574,17 @@ async function initPWA() {
     }
     if (Notification.permission !== 'granted') return;
 
+    var pushToken = _getAuthToken();
+    if (!pushToken) return;
+    reg = await navigator.serviceWorker.ready;
+    if (_getAuthToken() !== pushToken) return;
+    await _setBrowserPushUser(reg, '');
+    if (_getAuthToken() !== pushToken) return;
+    var meRes = await fetch('/api/auth/me');
+    if (!meRes.ok || _getAuthToken() !== pushToken) return;
+    var pushUser = (await meRes.json()).user_id;
+    if (!pushUser) return;
+
     var sub = await reg.pushManager.getSubscription();
     if (!sub) {
       var res = await fetch('/api/push/vapid-key');
@@ -11534,12 +11601,29 @@ async function initPWA() {
         applicationServerKey: arr,
       });
 
-      await fetch('/api/push/subscribe', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(sub.toJSON()),
-      });
     }
+    // A browser subscription is origin-scoped and can already belong to the
+    // previous login. Re-register it on every successful account bootstrap.
+    if (_getAuthToken() !== pushToken) return;
+    var bound;
+    for (var attempt = 0; attempt < 3; attempt++) {
+      if (_getAuthToken() !== pushToken) return;
+      var lease = await fetch('/api/push/binding?endpoint=' + encodeURIComponent(sub.endpoint));
+      if (!lease.ok || _getAuthToken() !== pushToken) return;
+      var payload = Object.assign(sub.toJSON(), { binding_version: (await lease.json()).revision });
+      if (_getAuthToken() !== pushToken) return;
+      bound = await fetch('/api/push/subscribe', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + pushToken },
+        body: JSON.stringify(payload),
+      });
+      if (bound.status !== 409) break;
+      // A concurrent refresh may have rotated the browser's actual keys.
+      // Never retry a stale in-memory subscription with a fresh lease.
+      sub = await reg.pushManager.getSubscription();
+      if (!sub) return;
+    }
+    if (bound.ok && _getAuthToken() === pushToken) await _setBrowserPushUser(reg, pushUser);
   } catch (e) {
     console.log('PWA init:', e.message);
   }

@@ -234,6 +234,10 @@ MIRU_CONTAINER_NAME=${MIRU_CONTAINER_NAME}
 SERVER_IP=${SERVER_IP}
 SERVER_PORT=${SERVER_PORT}
 
+# This installer creates a private single-owner instance, not a shared service.
+MIRU_ALLOW_OWNER_CLAIM=${MIRU_ALLOW_OWNER_CLAIM:-1}
+MIRU_INSTANCE_OWNER_USER_ID=${MIRU_INSTANCE_OWNER_USER_ID:-}
+
 TZ=${runtime_tz}
 TIMEZONE=${runtime_timezone}
 
